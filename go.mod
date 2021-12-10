@@ -1,10 +1,10 @@
-module github.com/twiny/whois
+module github.com/twiny/whois/v2
 
 go 1.17
 
 require (
 	github.com/goccy/go-yaml v1.9.4
-	golang.org/x/net v0.0.0-20210916014120-12bc252f5db8
+	golang.org/x/net v0.0.0-20211209124913-491a49abca63
 )
 
 require (
