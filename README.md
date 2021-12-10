@@ -10,7 +10,7 @@ TLDs() []string
 ```
 
 ## Install
-`go get github.com/twiny/whois`
+`go get github.com/twiny/whois/v2`
 
 ## Example
 
@@ -22,7 +22,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/twiny/whois"
+	"github.com/twiny/whois/v2"
 )
 
 func main() {
