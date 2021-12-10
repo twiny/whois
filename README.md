@@ -2,25 +2,17 @@
 
 a simple Go WHOIS Client API.
 
-## How it works
-- split domain name and finds corresponded WHOIS DB server from `db.yaml`.
-- dial a connection to the WHOIS server.
-- save the response.
-
-`whois.NewClient` function takes a `Dailer` argument.
+## API
 ```go
-// Dialer
-type Dialer interface {
-    DialContext(ctx context.Context, network, address string) (net.Conn, error)
-}
+Lookup(ctx context.Context, domain, server string) (string, error)
+WHOISHost(domain string) (string, error)
+TLDs() []string
 ```
-using a `nil` arg to `whois.NewClient` will create a client using local connect.
 
 ## Install
 `go get github.com/twiny/whois`
 
 ## Example
- - using local connection
 
 ```go
 package main
@@ -34,7 +26,11 @@ import (
 )
 
 func main() {
-	client, err := whois.NewClient(nil)
+	domain := "google.com"
+
+	// to use Socks5 - this format 'socks5://username:password@alpha.hostname.com:1023'
+	// otherwise use 'whois.Localhost' to use local connection
+	client, err := whois.NewClient(whois.Localhost)
 	if err != nil {
 		fmt.Println(err)
 		return
@@ -43,72 +39,22 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	text, err := client.Lookup(ctx, "google.com")
+	host, err := client.WHOISHost(domain)
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
 
-	fmt.Println(text)
+	resp, err := client.Lookup(ctx, "google.com", host)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	fmt.Println(resp)
 	fmt.Println("done.")
 }
 ```
-
- - using SOCKS5 connection
-```go
-package main
-
-import (
-	"context"
-	"fmt"
-	"time"
-
-	"github.com/twiny/whois"
-	"golang.org/x/net/proxy"
-)
-
-func main() {
-	// create default client
-	client, err := whois.NewClient(nil)
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-
-	// using SOCKS5
-	// auth if required
-	auth := &proxy.Auth{
-		User:     "username",
-		Password: "password",
-	}
-	dialer, err := proxy.SOCKS5("tcp", "hostname:port", auth, proxy.Direct)
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-
-	// clone default client
-	proxyClient, err := client.Clone(dialer)
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-
-	// ctx
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	text, err := proxyClient.Lookup(ctx, "google.com")
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-
-	fmt.Println(text)
-	fmt.Println("done.")
-}
-```
-
 ## Tracking
 - If you wish to add more WHOIS Server please [create a PR](https://github.com/twiny/whois/pulls).
 
