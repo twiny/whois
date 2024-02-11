@@ -4,11 +4,9 @@ import (
 	"bytes"
 	"context"
 	_ "embed"
-	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
-	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -19,98 +17,97 @@ import (
 )
 
 var (
-	testURL = "whois.verisign-grs.com:43" // TestURL
-	// dialer
-	forwrder = &net.Dialer{
-		Timeout: 15 * time.Second,
-	}
-	//
-	domainRegExp        = regexp.MustCompile(`(^(([[:alnum:]]-?)?([[:alnum:]]-?)+\.)+[A-Za-z]{2,20}$)`)
-	Localhost    string = "socks5://localhost" // used for default client
 	//go:embed db.yaml
 	whoisdb []byte
+
+	domainRegExp = regexp.MustCompile(`^(?:(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,24})$`)
+
+	defaultDialer = &net.Dialer{
+		Timeout:   15 * time.Second,
+		KeepAlive: 30 * time.Second,
+		DualStack: true,
+	}
 )
 
-// Client
-type Client struct {
-	socks  string
-	db     map[string]string
-	dialer func(network, addr string) (c net.Conn, err error)
-}
+type (
+	Client struct {
+		dialer proxy.Dialer
+		db     map[string]string
+	}
 
-// NewClient: a new WHOIS client using a Socks5 connection
-// in this format: socks5://username:password@alpha.hostname.com:1023
-// to use local connection pass `whois.Localhost` as argument.
-func NewClient(socks5 string) (*Client, error) {
-	// whois db
-	db := map[string]string{}
+	Response struct {
+		Domain    string
+		Name      string
+		TLD       string
+		WHOISHost string
+		WHOISRaw  string
+	}
+)
+
+// NewClient: create a new WHOIS client, if dialer is nil, it will use the default dialer
+func NewClient(dialer proxy.Dialer) (*Client, error) {
+	var db = map[string]string{}
 	if err := yaml.Unmarshal(whoisdb, &db); err != nil {
 		return nil, err
 	}
 
-	// if using local dialer
-	if socks5 == Localhost {
-		var d = &net.Dialer{}
-		return &Client{
-			socks:  socks5,
-			db:     db,
-			dialer: d.Dial,
-		}, nil
-	}
-
-	d, err := socks5Dialer(socks5)
-	if err != nil {
-		return nil, err
+	if dialer == nil {
+		dialer = defaultDialer
 	}
 
 	return &Client{
-		socks:  socks5,
 		db:     db,
-		dialer: d.Dial,
+		dialer: dialer,
 	}, nil
 }
 
-// Lookup a domain in a whois server db
-func (c *Client) Lookup(ctx context.Context, domain, server string) (string, error) {
-	// check if domain is domain
-	name, tld, _, err := c.split(domain)
+// Query: return raw WHOIS information for a domain
+func (c *Client) Query(ctx context.Context, domain string) (Response, error) {
+	var response Response
+	name, tld, whoisHost, err := c.split(domain)
 	if err != nil {
-		return "", err
+		return response, err
 	}
 
-	domain = name + "." + tld
+	domain = strings.Join([]string{name, tld}, ".")
 
-	var text string
-	result := make(chan string, 1)
+	var (
+		text      string
+		lookupErr error
+		result    = make(chan string, 1)
+	)
 
-	// lookup
 	go func() {
 		defer close(result)
 
-		text, err = c.lookup(domain, server)
+		text, lookupErr = c.lookup(domain, whoisHost)
 		result <- text
 	}()
 
-	// wait
 	for {
 		select {
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return response, ctx.Err()
 		case text := <-result:
-			if err != nil {
-				return "", err
+			if lookupErr != nil {
+				return response, err
 			}
-			return text, nil
+
+			response.Domain = domain
+			response.Name = name
+			response.TLD = tld
+			response.WHOISHost = whoisHost
+			response.WHOISRaw = text
+
+			return response, nil
 		}
 	}
 }
 
-// lookup
-func (c *Client) lookup(domain, server string) (string, error) {
-	// WHOIS server address at port 43
-	addr := net.JoinHostPort(server, "43")
+func (c *Client) lookup(domain, whoisHost string) (string, error) {
+	addr := net.JoinHostPort(whoisHost, "43") // WHOIS server address at port 43
 
-	conn, err := c.dialer("tcp", addr)
+	conn, err := c.dialer.Dial("tcp", addr)
 	if err != nil {
 		return "", err
 	}
@@ -124,7 +121,7 @@ func (c *Client) lookup(domain, server string) (string, error) {
 		return "", err
 	}
 
-	resp, err := ioutil.ReadAll(conn)
+	resp, err := io.ReadAll(conn)
 	if err != nil {
 		return "", err
 	}
@@ -136,78 +133,36 @@ func (c *Client) lookup(domain, server string) (string, error) {
 	return strings.Replace(string(resp), "\r", "", -1), nil
 }
 
-// Split domain name into 3 parts name, tld, server or an error
-func (c *Client) WHOISHost(domain string) (string, error) {
-	_, _, server, err := c.split(domain)
-	if err != nil {
-		return "", err
-	}
-	return server, nil
-}
-
-// split
-func (c *Client) split(domain string) (name, tld, server string, err error) {
-	domain = strings.ToLower(domain)
-
-	// validate
-	if !domainRegExp.MatchString(domain) {
-		return "", "", "", fmt.Errorf("domain %s looks invalid", domain)
+// split: validate and split domain: name, tld, server or error
+func (c *Client) split(raw string) (string, string, string, error) {
+	if !domainRegExp.MatchString(raw) {
+		return "", "", "", fmt.Errorf("invalid domain: %s", raw)
 	}
 
-	// extract TLD from domaian
-	tld = publicsuffix.List.PublicSuffix(domain)
+	tld, icann := publicsuffix.PublicSuffix(raw)
+	if !icann {
+		return "", "", "", fmt.Errorf("unsupported TLD: %s", tld)
+	}
 
-	// find whois host
 	server, found := c.db[tld]
 	if !found {
-		return "", "", "", fmt.Errorf("could not find corresponded WHOIS server for %s", tld)
+		return "", "", "", fmt.Errorf("unsupported TLD: %s", tld)
 	}
 
-	name = strings.TrimSuffix(domain, "."+tld)
+	trimmedDomain := strings.TrimSuffix(raw, "."+tld)
 
-	return
-}
+	// Split the raw domain into parts.
+	// e.g. www.google.com -> www.google -> google
+	// If no parts, the trimmed domain itself is the name.
+	// Otherwise, the name is the last part in array.
+	parts := strings.Split(trimmedDomain, ".")
 
-// TLDs
-func (c *Client) TLDs() []string {
-	var tlds = []string{}
-	for tld := range c.db {
-		tlds = append(tlds, tld)
-	}
-	return tlds
-}
-
-// socks5Dialer
-func socks5Dialer(socks5 string) (proxy.Dialer, error) {
-	surl, err := url.Parse(socks5)
-	if err != nil {
-		return nil, err
+	var name string
+	if len(parts) == 0 {
+		name = trimmedDomain
+	} else {
+		name = parts[len(parts)-1]
 	}
 
-	if surl.Scheme != "socks5" {
-		return nil, errors.New("socks must start with socks5://")
-	}
-
-	// check auth
-	username := surl.User.Username()
-	password, found := surl.User.Password()
-
-	auth := &proxy.Auth{}
-	if username+password == "" && !found {
-		auth = nil
-	}
-
-	d, err := proxy.SOCKS5("tcp", surl.Host, auth, forwrder)
-	if err != nil {
-		return nil, err
-	}
-
-	// to test connection
-	conn, err := d.Dial("tcp", testURL)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-
-	return d, nil
+	return name, tld, server, nil
 }
